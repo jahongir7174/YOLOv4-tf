@@ -25,7 +25,7 @@ def main():
         for f_name in f.readlines()[:100]:
             f_names.append(f_name.rstrip().split(' ')[0])
     for f_name in f_names[:1]:
-        image = cv2.imread(f'../Dataset/Dubai/IMAGES/{f_name}.jpg')
+        image = cv2.imread(join(config.data_dir, config.image_dir, f'{f_name}.jpg'))
         image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
 
         image_data, scale, dw, dh = util.resize(image)
