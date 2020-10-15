@@ -2,7 +2,8 @@
 
 #### Train
 * Change variables in `utils\config.py` based on your dataset
-* Run `python generate.py` for generating tf record
+* Run `python generate.py` for generating anchors
+* Change anchors in `utils\config.py`
 * Run `python train.py` for training
 
 #### Test

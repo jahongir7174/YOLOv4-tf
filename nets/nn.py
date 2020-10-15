@@ -1,8 +1,10 @@
-import numpy as np
+import math
+
 import tensorflow as tf
 from tensorflow import nn
 from tensorflow.keras import backend
 from tensorflow.keras import layers
+from tensorflow.keras import models
 
 from utils import config
 
@@ -103,7 +105,8 @@ def backbone(inputs):
     return skip1, skip2, x
 
 
-def build_model(inputs, nb_classes):
+def build_model(training=True):
+    inputs = layers.Input([config.image_size, config.image_size, 3])
     x1, x2, x3 = backbone(inputs)
 
     x = convolution_block(x3, 256, 1)
@@ -131,7 +134,7 @@ def build_model(inputs, nb_classes):
 
     x1 = x
     x = convolution_block(x, 256, 3)
-    small = layers.Conv2D(3 * (nb_classes + 5), 1, kernel_initializer=initializer)(x)
+    large = layers.Conv2D(3 * (len(config.classes) + 5), 1, kernel_initializer=initializer)(x)
 
     x = convolution_block(x1, 256, 3, 2)
     x = layers.concatenate([x, x2])
@@ -144,7 +147,7 @@ def build_model(inputs, nb_classes):
 
     x2 = x
     x = convolution_block(x, 512, 3)
-    medium = layers.Conv2D(3 * (nb_classes + 5), 1, kernel_initializer=initializer)(x)
+    medium = layers.Conv2D(3 * (len(config.classes) + 5), 1, kernel_initializer=initializer)(x)
 
     x = convolution_block(x2, 512, 3, 2)
     x = layers.concatenate([x, x3])
@@ -156,127 +159,238 @@ def build_model(inputs, nb_classes):
     x = convolution_block(x, 512, 1)
 
     x = convolution_block(x, 1024, 3)
-    large = layers.Conv2D(3 * (nb_classes + 5), 1, kernel_initializer=initializer)(x)
+    small = layers.Conv2D(3 * (len(config.classes) + 5), 1, kernel_initializer=initializer)(x)
 
-    return small, medium, large
-
-
-def decode(output, i=0, nb_classes=20):
-    shape = tf.shape(output)
-    batch_size = shape[0]
-    output_size = shape[1]
-
-    output = tf.reshape(output, (batch_size, output_size, output_size, 3, 5 + nb_classes))
-
-    raw_xy = output[:, :, :, :, 0:2]
-    raw_wh = output[:, :, :, :, 2:4]
-    raw_conf = output[:, :, :, :, 4:5]
-    raw_prob = output[:, :, :, :, 5:]
-
-    y = tf.tile(tf.range(output_size, dtype=tf.int32)[:, tf.newaxis], [1, output_size])
-    x = tf.tile(tf.range(output_size, dtype=tf.int32)[tf.newaxis, :], [output_size, 1])
-
-    xy_grid = tf.concat([x[:, :, tf.newaxis], y[:, :, tf.newaxis]], axis=-1)
-    xy_grid = tf.tile(xy_grid[tf.newaxis, :, :, tf.newaxis, :], [batch_size, 1, 1, 3, 1])
-    xy_grid = tf.cast(xy_grid, tf.float32)
-
-    pred_xy = (tf.sigmoid(raw_xy) + xy_grid) * config.strides[i]
-    pred_wh = (tf.exp(raw_wh) * config.anchors[i]) * config.strides[i]
-    pred_xy_wh = tf.concat([pred_xy, pred_wh], axis=-1)
-
-    pred_conf = tf.sigmoid(raw_conf)
-    pred_prob = tf.sigmoid(raw_prob)
-
-    return tf.concat([pred_xy_wh, pred_conf, pred_prob], axis=-1)
+    if training:
+        return models.Model(inputs, [small, medium, large])
+    else:
+        return models.Model(inputs, predict([small, medium, large]))
 
 
-def box_iou(boxes1, boxes2):
-    boxes1_area = boxes1[..., 2] * boxes1[..., 3]
-    boxes2_area = boxes2[..., 2] * boxes2[..., 3]
+def process_layer(feature_map, anchors):
+    grid_size = tf.shape(feature_map)[1:3]
+    ratio = tf.cast(tf.constant([config.image_size, config.image_size]) / grid_size, tf.float32)
+    rescaled_anchors = [(anchor[0] / ratio[1], anchor[1] / ratio[0]) for anchor in anchors]
 
-    boxes1 = tf.concat([boxes1[..., :2] - boxes1[..., 2:] * 0.5,
-                        boxes1[..., :2] + boxes1[..., 2:] * 0.5], axis=-1)
-    boxes2 = tf.concat([boxes2[..., :2] - boxes2[..., 2:] * 0.5,
-                        boxes2[..., :2] + boxes2[..., 2:] * 0.5], axis=-1)
+    feature_map = tf.reshape(feature_map, [-1, grid_size[0], grid_size[1], 3, 5 + len(config.classes)])
 
-    left_up = tf.maximum(boxes1[..., :2], boxes2[..., :2])
-    right_down = tf.minimum(boxes1[..., 2:], boxes2[..., 2:])
+    box_centers, box_sizes, conf, prob = tf.split(feature_map, [2, 2, 1, len(config.classes)], axis=-1)
+    box_centers = tf.nn.sigmoid(box_centers)
 
-    inter_section = tf.maximum(right_down - left_up, 0.0)
-    inter_area = inter_section[..., 0] * inter_section[..., 1]
-    union_area = boxes1_area + boxes2_area - inter_area
+    grid_x = tf.range(grid_size[1], dtype=tf.int32)
+    grid_y = tf.range(grid_size[0], dtype=tf.int32)
 
-    return 1.0 * inter_area / union_area
+    grid_x, grid_y = tf.meshgrid(grid_x, grid_y)
 
+    x_offset = tf.reshape(grid_x, (-1, 1))
+    y_offset = tf.reshape(grid_y, (-1, 1))
 
-def box_g_iou(boxes1, boxes2):
-    boxes1 = tf.concat([boxes1[..., :2] - boxes1[..., 2:] * 0.5,
-                        boxes1[..., :2] + boxes1[..., 2:] * 0.5], axis=-1)
-    boxes2 = tf.concat([boxes2[..., :2] - boxes2[..., 2:] * 0.5,
-                        boxes2[..., :2] + boxes2[..., 2:] * 0.5], axis=-1)
+    x_y_offset = tf.concat([x_offset, y_offset], axis=-1)
+    x_y_offset = tf.cast(tf.reshape(x_y_offset, [grid_size[0], grid_size[1], 1, 2]), tf.float32)
 
-    boxes1 = tf.concat([tf.minimum(boxes1[..., :2], boxes1[..., 2:]),
-                        tf.maximum(boxes1[..., :2], boxes1[..., 2:])], axis=-1)
-    boxes2 = tf.concat([tf.minimum(boxes2[..., :2], boxes2[..., 2:]),
-                        tf.maximum(boxes2[..., :2], boxes2[..., 2:])], axis=-1)
+    box_centers = box_centers + x_y_offset
+    box_centers = box_centers * ratio[::-1]
 
-    boxes1_area = (boxes1[..., 2] - boxes1[..., 0]) * (boxes1[..., 3] - boxes1[..., 1])
-    boxes2_area = (boxes2[..., 2] - boxes2[..., 0]) * (boxes2[..., 3] - boxes2[..., 1])
+    box_sizes = tf.exp(box_sizes) * rescaled_anchors
+    box_sizes = box_sizes * ratio[::-1]
 
-    left_up = tf.maximum(boxes1[..., :2], boxes2[..., :2])
-    right_down = tf.minimum(boxes1[..., 2:], boxes2[..., 2:])
+    boxes = tf.concat([box_centers, box_sizes], axis=-1)
 
-    inter_section = tf.maximum(right_down - left_up, 0.0)
-    inter_area = inter_section[..., 0] * inter_section[..., 1]
-    union_area = boxes1_area + boxes2_area - inter_area
-    iou = inter_area / union_area
-
-    enclose_left_up = tf.minimum(boxes1[..., :2], boxes2[..., :2])
-    enclose_right_down = tf.maximum(boxes1[..., 2:], boxes2[..., 2:])
-    enclose = tf.maximum(enclose_right_down - enclose_left_up, 0.0)
-    enclose_area = enclose[..., 0] * enclose[..., 1]
-
-    return iou - 1.0 * (enclose_area - union_area) / enclose_area
+    return x_y_offset, boxes, conf, prob
 
 
-def compute_loss(pred, output, label, boxes, i=0):
-    shape = tf.shape(output)
-    batch_size = shape[0]
-    output_size = shape[1]
-    input_size = config.strides[i] * output_size
-    output = tf.reshape(output, (batch_size, output_size, output_size, 3, 5 + 20))
+def reshape(features):
+    x_y_offset, boxes, conf, prob = features
+    grid_size = tf.shape(x_y_offset)[:2]
+    boxes = tf.reshape(boxes, [-1, grid_size[0] * grid_size[1] * 3, 4])
+    conf = tf.reshape(conf, [-1, grid_size[0] * grid_size[1] * 3, 1])
+    prob = tf.reshape(prob, [-1, grid_size[0] * grid_size[1] * 3, len(config.classes)])
+    return boxes, conf, prob
 
-    raw_conf = output[:, :, :, :, 4:5]
-    raw_prob = output[:, :, :, :, 5:]
 
-    pred_xy_wh = pred[:, :, :, :, 0:4]
-    pred_conf = pred[:, :, :, :, 4:5]
+def predict(feature_maps):
+    feature_map_1, feature_map_2, feature_map_3 = feature_maps
 
-    label_xy_wh = label[:, :, :, :, 0:4]
-    respond_bbox = label[:, :, :, :, 4:5]
-    label_prob = label[:, :, :, :, 5:]
+    feature_map_anchors = [(feature_map_1, config.anchors[6:9]),
+                           (feature_map_2, config.anchors[3:6]),
+                           (feature_map_3, config.anchors[0:3])]
+    reorg_results = [process_layer(feature_map, anchors) for (feature_map, anchors) in feature_map_anchors]
 
-    g_iou = tf.expand_dims(box_g_iou(pred_xy_wh, label_xy_wh), axis=-1)
-    input_size = tf.cast(input_size, tf.float32)
+    boxes_list, conf_list, prob_list = [], [], []
+    for result in reorg_results:
+        box, conf, prob = reshape(result)
+        boxes_list.append(box)
+        conf_list.append(tf.sigmoid(conf))
+        prob_list.append(tf.sigmoid(prob))
 
-    bbox_loss_scale = 2.0 - 1.0 * label_xy_wh[:, :, :, :, 2:3] * label_xy_wh[:, :, :, :, 3:4] / (input_size ** 2)
-    g_iou_loss = respond_bbox * bbox_loss_scale * (1 - g_iou)
+    boxes = tf.concat(boxes_list, axis=1)
+    conf = tf.concat(conf_list, axis=1)
+    prob = tf.concat(prob_list, axis=1)
 
-    iou = box_iou(pred_xy_wh[:, :, :, :, np.newaxis, :], boxes[:, np.newaxis, np.newaxis, np.newaxis, :, :])
-    max_iou = tf.expand_dims(tf.reduce_max(iou, axis=-1), axis=-1)
+    center_x, center_y, width, height = tf.split(boxes, [1, 1, 1, 1], axis=-1)
+    x_min = center_x - width / 2
+    y_min = center_y - height / 2
+    x_max = center_x + width / 2
+    y_max = center_y + height / 2
 
-    respond_bgd = (1.0 - respond_bbox) * tf.cast(max_iou < 0.5, tf.float32)
+    boxes = tf.concat([x_min, y_min, x_max, y_max], axis=-1)
+    return gpu_nms(boxes, conf * prob, len(config.classes))
 
-    conf_focal = tf.pow(respond_bbox - pred_conf, 2)
 
-    conf_loss = conf_focal * (respond_bbox * tf.nn.sigmoid_cross_entropy_with_logits(respond_bbox, raw_conf)
-                              +
-                              respond_bgd * tf.nn.sigmoid_cross_entropy_with_logits(respond_bbox, raw_conf))
+def gpu_nms(boxes, scores, num_classes, max_boxes=150, score_thresh=0.2, nms_thresh=0.1):
+    boxes_list, label_list, score_list = [], [], []
+    max_boxes = tf.constant(max_boxes, dtype='int32')
 
-    prob_loss = respond_bbox * tf.nn.sigmoid_cross_entropy_with_logits(label_prob, raw_prob)
+    boxes = tf.reshape(boxes, [-1, 4])
+    score = tf.reshape(scores, [-1, num_classes])
 
-    g_iou_loss = tf.reduce_mean(tf.reduce_sum(g_iou_loss, axis=[1, 2, 3, 4]))
-    conf_loss = tf.reduce_mean(tf.reduce_sum(conf_loss, axis=[1, 2, 3, 4]))
-    prob_loss = tf.reduce_mean(tf.reduce_sum(prob_loss, axis=[1, 2, 3, 4]))
+    mask = tf.greater_equal(score, tf.constant(score_thresh))
+    for i in range(num_classes):
+        filter_boxes = tf.boolean_mask(boxes, mask[:, i])
+        filter_score = tf.boolean_mask(score[:, i], mask[:, i])
+        nms_indices = tf.image.non_max_suppression(boxes=filter_boxes,
+                                                   scores=filter_score,
+                                                   max_output_size=max_boxes,
+                                                   iou_threshold=nms_thresh, name='nms_indices')
+        label_list.append(tf.ones_like(tf.gather(filter_score, nms_indices), 'int32') * i)
+        boxes_list.append(tf.gather(filter_boxes, nms_indices))
+        score_list.append(tf.gather(filter_score, nms_indices))
 
-    return g_iou_loss, conf_loss, prob_loss
+    boxes = tf.concat(boxes_list, axis=0)
+    score = tf.concat(score_list, axis=0)
+    label = tf.concat(label_list, axis=0)
+
+    return boxes, score, label
+
+
+def box_iou(pred_boxes, valid_true_boxes):
+    pred_box_xy = pred_boxes[..., 0:2]
+    pred_box_wh = pred_boxes[..., 2:4]
+
+    pred_box_xy = tf.expand_dims(pred_box_xy, -2)
+    pred_box_wh = tf.expand_dims(pred_box_wh, -2)
+
+    true_box_xy = valid_true_boxes[:, 0:2]
+    true_box_wh = valid_true_boxes[:, 2:4]
+
+    intersect_min = tf.maximum(pred_box_xy - pred_box_wh / 2., true_box_xy - true_box_wh / 2.)
+    intersect_max = tf.minimum(pred_box_xy + pred_box_wh / 2., true_box_xy + true_box_wh / 2.)
+
+    intersect_wh = tf.maximum(intersect_max - intersect_min, 0.)
+
+    intersect_area = intersect_wh[..., 0] * intersect_wh[..., 1]
+
+    pred_box_area = pred_box_wh[..., 0] * pred_box_wh[..., 1]
+    true_box_area = true_box_wh[..., 0] * true_box_wh[..., 1]
+    true_box_area = tf.expand_dims(true_box_area, axis=0)
+
+    return intersect_area / (pred_box_area + true_box_area - intersect_area + 1e-10)
+
+
+def process_loss(feature_map_i, y_true, anchors):
+    grid_size = tf.shape(feature_map_i)[1:3]
+    ratio = tf.cast(tf.constant([config.image_size, config.image_size]) / grid_size, tf.float32)
+    batch_size = tf.cast(tf.shape(feature_map_i)[0], tf.float32)
+
+    x_y_offset, pred_boxes, pred_conf, pred_prob = process_layer(feature_map_i, anchors)
+
+    object_mask = y_true[..., 4:5]
+
+    def loop_cond(idx, _):
+        return tf.less(idx, tf.cast(batch_size, tf.int32))
+
+    def loop_body(idx, mask):
+        valid_true_boxes = tf.boolean_mask(y_true[idx, ..., 0:4], tf.cast(object_mask[idx, ..., 0], 'bool'))
+        iou = box_iou(pred_boxes[idx], valid_true_boxes)
+        best_iou = tf.reduce_max(iou, axis=-1)
+        ignore_mask_tmp = tf.cast(best_iou < 0.5, tf.float32)
+        mask = mask.write(idx, ignore_mask_tmp)
+        return idx + 1, mask
+
+    ignore_mask = tf.TensorArray(tf.float32, size=0, dynamic_size=True)
+
+    _, ignore_mask = tf.while_loop(cond=loop_cond, body=loop_body, loop_vars=[0, ignore_mask])
+    ignore_mask = ignore_mask.stack()
+    ignore_mask = tf.expand_dims(ignore_mask, -1)
+
+    pred_box_xy = pred_boxes[..., 0:2]
+    pred_box_wh = pred_boxes[..., 2:4]
+
+    true_xy = y_true[..., 0:2] / ratio[::-1] - x_y_offset
+    pred_xy = pred_box_xy / ratio[::-1] - x_y_offset
+
+    true_tw_th = y_true[..., 2:4] / anchors
+    pred_tw_th = pred_box_wh / anchors
+    true_tw_th = tf.where(condition=tf.equal(true_tw_th, 0), x=tf.ones_like(true_tw_th), y=true_tw_th)
+    pred_tw_th = tf.where(condition=tf.equal(pred_tw_th, 0), x=tf.ones_like(pred_tw_th), y=pred_tw_th)
+    true_tw_th = tf.math.log(tf.clip_by_value(true_tw_th, 1e-9, 1e9))
+    pred_tw_th = tf.math.log(tf.clip_by_value(pred_tw_th, 1e-9, 1e9))
+
+    box_loss_scale_1 = y_true[..., 2:3] / tf.cast(tf.constant([config.image_size, config.image_size])[1], tf.float32)
+    box_loss_scale_2 = y_true[..., 3:4] / tf.cast(tf.constant([config.image_size, config.image_size])[0], tf.float32)
+
+    box_loss_scale = 2. - box_loss_scale_1 * box_loss_scale_2
+
+    mix_w = y_true[..., -1:]
+
+    xy_loss = tf.reduce_sum(tf.square(true_xy - pred_xy) * object_mask * box_loss_scale * mix_w) / batch_size
+    wh_loss = tf.reduce_sum(tf.square(true_tw_th - pred_tw_th) * object_mask * box_loss_scale * mix_w) / batch_size
+
+    conf_pos_mask = object_mask
+    conf_neg_mask = (1 - object_mask) * ignore_mask
+    conf_loss_pos = conf_pos_mask * tf.nn.sigmoid_cross_entropy_with_logits(labels=object_mask, logits=pred_conf)
+    conf_loss_neg = conf_neg_mask * tf.nn.sigmoid_cross_entropy_with_logits(labels=object_mask, logits=pred_conf)
+
+    conf_loss = conf_loss_pos + conf_loss_neg
+
+    alpha = 0.25
+    gamma = 1.5
+    focal_mask = alpha * tf.pow(tf.abs(object_mask - tf.sigmoid(pred_conf)), gamma)
+    conf_loss *= focal_mask
+
+    conf_loss = tf.reduce_sum(conf_loss * mix_w) / batch_size
+
+    delta = 0.01
+    label_target = (1 - delta) * y_true[..., 5:-1] + delta * 1. / len(config.classes)
+
+    class_loss = object_mask * tf.nn.sigmoid_cross_entropy_with_logits(labels=label_target,
+                                                                       logits=pred_prob) * mix_w
+    class_loss = tf.reduce_sum(class_loss) / batch_size
+
+    return xy_loss, wh_loss, conf_loss, class_loss
+
+
+def compute_loss(y_pred, y_true):
+    loss_xy, loss_wh, loss_conf, loss_class = 0., 0., 0., 0.
+    anchor_group = [config.anchors[6:9], config.anchors[3:6], config.anchors[0:3]]
+
+    for i in range(len(y_pred)):
+        loss = process_loss(y_pred[i], y_true[i], anchor_group[i])
+
+        loss_xy += loss[0]
+        loss_wh += loss[1]
+        loss_conf += loss[2]
+        loss_class += loss[3]
+    return loss_xy + loss_wh + loss_conf + loss_class
+
+
+class CosineLrSchedule(tf.optimizers.schedules.LearningRateSchedule):
+    def __init__(self, warmup_step):
+        super().__init__()
+        self.lr_min = 1e-5
+        self.lr_max = 1e-3
+        self.warmup_step = warmup_step
+        self.decay_steps = tf.cast(warmup_step * (config.epochs - 1), tf.float32)
+
+    def __call__(self, step):
+        cos = tf.cos(math.pi * (tf.cast(step, tf.float32) - self.warmup_step) / self.decay_steps)
+        linear_warmup = tf.cast(step, dtype=tf.float32) / self.warmup_step * self.lr_max
+        cos_lr = self.lr_min + 0.5 * (self.lr_max - self.lr_min) * (1 + cos / self.decay_steps)
+
+        return tf.where(step < self.warmup_step, linear_warmup, cos_lr)
+
+    def get_config(self):
+        return {"lr_min": self.lr_min,
+                "lr_max": self.lr_max,
+                "decay_steps": self.decay_steps,
+                "lr_warmup_step": self.warmup_step}

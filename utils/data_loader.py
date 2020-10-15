@@ -1,65 +1,67 @@
+import numpy as np
 import tensorflow as tf
+from tensorflow.keras.utils import OrderedEnqueuer
+from tensorflow.keras.utils import Sequence
+
 from utils import config
+from utils.util import load_image
+from utils.util import load_label
+from utils.util import process_box
+from utils.util import random_crop
+from utils.util import random_horizontal_flip
+from utils.util import random_translate
+from utils.util import resize
 
 
-class TFRecordLoader:
-    def __init__(self, batch_size, nb_epoch, nb_classes=20):
-        super(TFRecordLoader, self).__init__()
-        self.nb_epoch = nb_epoch
-        self.nb_classes = nb_classes
-        self.batch_size = batch_size
-        self.feature_description = {'path': tf.io.FixedLenFeature([], tf.string),
-                                    's_label': tf.io.FixedLenFeature([], tf.string),
-                                    'm_label': tf.io.FixedLenFeature([], tf.string),
-                                    'l_label': tf.io.FixedLenFeature([], tf.string),
-                                    's_boxes': tf.io.FixedLenFeature([], tf.string),
-                                    'm_boxes': tf.io.FixedLenFeature([], tf.string),
-                                    'l_boxes': tf.io.FixedLenFeature([], tf.string)}
+class Generator(Sequence):
+    def __init__(self, f_names):
+        self.f_names = f_names
+        self.on_epoch_end()
 
-    def parse_data(self, tf_record):
-        features = tf.io.parse_single_example(tf_record, self.feature_description)
+    def __len__(self):
+        return int(np.floor(len(self.f_names) / config.batch_size))
 
-        image = tf.io.read_file(features['path'])
-        image = tf.io.decode_jpeg(image, 3)
-        image = tf.image.convert_image_dtype(image, dtype=tf.uint8)
-        image = tf.cast(image, tf.float32)
-        image = image / 255.
+    def __getitem__(self, index):
+        image = load_image(self.f_names[index])
+        boxes, label = load_label(self.f_names[index])
+        boxes = np.concatenate((boxes, np.full(shape=(boxes.shape[0], 1), fill_value=1., dtype=np.float32)), axis=-1)
+        image, boxes = random_horizontal_flip(image, boxes)
+        image, boxes = random_crop(image, boxes)
+        image, boxes = random_translate(image, boxes)
+        image, boxes = resize(image, boxes)
 
-        mean = tf.constant([0.485, 0.456, 0.406])
-        mean = tf.expand_dims(mean, axis=0)
-        mean = tf.expand_dims(mean, axis=0)
+        image = image.astype(np.float32)
+        image /= 255.
+        mean = [0.485, 0.456, 0.406]
+        std = [0.229, 0.224, 0.225]
         image -= mean
-
-        std = tf.constant([0.229, 0.224, 0.225])
-        std = tf.expand_dims(std, axis=0)
-        std = tf.expand_dims(std, axis=0)
         image /= std
+        y_true_1, y_true_2, y_true_3 = process_box(boxes, label)
+        return image, y_true_1, y_true_2, y_true_3
 
-        s_label = tf.io.decode_raw(features['s_label'], tf.float32)
-        s_label = tf.reshape(s_label, (64, 64, 3, 5 + self.nb_classes))
+    def on_epoch_end(self):
+        np.random.shuffle(self.f_names)
 
-        m_label = tf.io.decode_raw(features['m_label'], tf.float32)
-        m_label = tf.reshape(m_label, (32, 32, 3, 5 + self.nb_classes))
 
-        l_label = tf.io.decode_raw(features['l_label'], tf.float32)
-        l_label = tf.reshape(l_label, (16, 16, 3, 5 + self.nb_classes))
+def input_fn(f_names):
+    def generator_fn():
+        generator = OrderedEnqueuer(Generator(f_names), True)
+        generator.start(workers=8, max_queue_size=10)
+        while True:
+            image, y_true_1, y_true_2, y_true_3 = generator.get().__next__()
+            yield image, y_true_1, y_true_2, y_true_3
 
-        s_boxes = tf.io.decode_raw(features['s_boxes'], tf.float32)
-        s_boxes = tf.reshape(s_boxes, (config.max_boxes, 4))
+    output_types = (tf.float32, tf.float32, tf.float32, tf.float32)
+    output_shapes = ((config.image_size, config.image_size, 3),
+                     (config.image_size // 32, config.image_size // 32, 3, len(config.classes) + 6),
+                     (config.image_size // 16, config.image_size // 16, 3, len(config.classes) + 6),
+                     (config.image_size // 8, config.image_size // 8, 3, len(config.classes) + 6),)
 
-        m_boxes = tf.io.decode_raw(features['m_boxes'], tf.float32)
-        m_boxes = tf.reshape(m_boxes, (config.max_boxes, 4))
+    dataset = tf.data.Dataset.from_generator(generator=generator_fn,
+                                             output_types=output_types,
+                                             output_shapes=output_shapes)
 
-        l_boxes = tf.io.decode_raw(features['l_boxes'], tf.float32)
-        l_boxes = tf.reshape(l_boxes, (config.max_boxes, 4))
-
-        return image, s_label, s_boxes, m_label, m_boxes, l_label, l_boxes
-
-    def load_data(self, file_names):
-        reader = tf.data.TFRecordDataset(file_names)
-        reader = reader.shuffle(len(file_names))
-        reader = reader.map(self.parse_data, tf.data.experimental.AUTOTUNE)
-        reader = reader.repeat(self.nb_epoch + 1)
-        reader = reader.batch(self.batch_size)
-        reader = reader.prefetch(tf.data.experimental.AUTOTUNE)
-        return reader
+    dataset = dataset.repeat(config.epochs + 1)
+    dataset = dataset.batch(config.batch_size)
+    dataset = dataset.prefetch(tf.data.experimental.AUTOTUNE)
+    return dataset
