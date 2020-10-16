@@ -23,3 +23,6 @@
 * xml file should be in PascalVOC format
 * for making `train.txt`, see `VOC2012/ImageSets/Main/train.txt` 
 
+#### Reference
+* https://github.com/AlexeyAB/darknet
+* https://github.com/wizyoung/YOLOv3_TensorFlow
